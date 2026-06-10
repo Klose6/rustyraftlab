@@ -21,25 +21,74 @@ pub struct LogEntry {
     pub data: Vec<u8>,
 }
 
+impl LogEntry {
+    /// Sentinel entry at Raft index 0; never committed or applied.
+    pub fn sentinel() -> Self {
+        Self {
+            term: 0,
+            data: Vec::new(),
+        }
+    }
+}
+
 /// One server's Raft state and leader replication progress.
 #[derive(Debug, Clone)]
 pub struct RaftNode {
     /// Unique ID of this node in the cluster.
     pub id: u64,
-    /// Latest term this node has seen (monotonically increasing).
+    /// (Persistent) Latest term this node has seen (monotonically increasing).
     pub term: u64,
-    /// Current role of this node.
+    /// (Volatile) Current role of this node.
     pub role: Role,
-    /// Replicated log entries.
+    /// (Persistent) The node that this node voted for in the current term.
+    pub voted_for: Option<u64>,
+    /// (Persistent) Replicated log entries. Index 0 is a sentinel; real entries start at index 1.
     pub log: Vec<LogEntry>,
-    /// Highest log index known to be committed.
+    /// (Volatile) Highest log index known to be committed.
     pub commit_index: u64,
-    /// Highest log index applied to the state machine.
+    /// (Volatile) Highest log index applied to the state machine.
     pub last_applied: u64,
-    /// Per-follower next log index to send (leader only).
+    /// (Volatile) Per-follower next log index to send (leader only).
     pub next_index: HashMap<u64, u64>,
-    /// Per-follower highest replicated index (leader only).
+    /// (Volatile) Per-follower highest replicated index (leader only).
     pub match_index: HashMap<u64, u64>,
+    /// Peer IDs in the cluster.
+    pub peer_ids: Vec<u64>,
+}
+
+impl RaftNode {
+    pub fn new(id: u64, peer_ids: Vec<u64>) -> Self {
+        Self {
+            id,
+            term: 0,
+            role: Role::Follower,
+            voted_for: None,
+            log: vec![LogEntry::sentinel()],
+            commit_index: 0,
+            last_applied: 0,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
+            peer_ids,
+        }
+    }
+
+    /// Raft index of the last log entry.
+    pub fn last_log_index(&self) -> u64 {
+        self.log.len().saturating_sub(1) as u64
+    }
+
+    /// Term of the last log entry.
+    pub fn last_log_term(&self) -> u64 {
+        self.log_term_at(self.last_log_index())
+    }
+
+    /// Term of the log entry at the given Raft index.
+    pub fn log_term_at(&self, index: u64) -> u64 {
+        self.log
+            .get(index as usize)
+            .map(|entry| entry.term)
+            .unwrap_or(0)
+    }
 }
 
 /// RPC messages exchanged between Raft servers.
