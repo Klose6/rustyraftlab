@@ -91,12 +91,25 @@ impl RaftNode {
     }
 
     pub fn handle_request_vote(&mut self, request: RequestVote) -> RequestVoteResponse {
+        /// If the candidate's term is less than the current term, reject the vote.
         if request.term < self.term {
             return RequestVoteResponse {
                 term: self.term,
                 vote_granted: false,
             };
         }
+        /// If the candidate has not voted for anyone in the current term, or the candidate is the same as the voted for node, vote for the candidate in the request.
+        if self.voted_for.is_none() || self.voted_for.unwrap() == request.candidate_id {
+            self.voted_for = Some(request.candidate_id);
+            return RequestVoteResponse {
+                term: self.term,
+                vote_granted: true,
+            };
+        }
+        return RequestVoteResponse {
+            term: self.term,
+            vote_granted: false,
+        };
     }
 
     pub fn handle_append_entries(&mut self, request: AppendEntries) -> AppendEntriesResponse {
