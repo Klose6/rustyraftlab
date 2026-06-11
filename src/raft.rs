@@ -89,6 +89,24 @@ impl RaftNode {
             .map(|entry| entry.term)
             .unwrap_or(0)
     }
+
+    pub fn handle_request_vote(&mut self, request: RequestVote) -> RequestVoteResponse {
+        if request.term < self.term {
+            return RequestVoteResponse {
+                term: self.term,
+                vote_granted: false,
+            };
+        }
+    }
+
+    pub fn handle_append_entries(&mut self, request: AppendEntries) -> AppendEntriesResponse {
+        if request.term < self.term {
+            return AppendEntriesResponse {
+                term: self.term,
+                success: false,
+            };
+        }
+    }
 }
 
 /// RPC messages exchanged between Raft servers.
