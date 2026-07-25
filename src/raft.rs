@@ -31,6 +31,63 @@ impl LogEntry {
     }
 }
 
+/// RPC messages exchanged between Raft servers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    RequestVote(RequestVote),
+    AppendEntries(AppendEntries),
+    RequestVoteResponse(RequestVoteResponse),
+    AppendEntriesResponse(AppendEntriesResponse),
+}
+
+/// RequestVote RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestVote {
+    /// Candidate's term.
+    pub term: u64,
+    /// Candidate requesting the vote.
+    pub candidate_id: u64,
+    /// Index of the candidate's last log entry.
+    pub last_log_index: u64,
+    /// Term of the candidate's last log entry.
+    pub last_log_term: u64,
+}
+
+/// AppendEntries RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEntries {
+    /// Leader's term.
+    pub term: u64,
+    /// So followers can redirect clients.
+    pub leader_id: u64,
+    /// Index of the log entry immediately preceding the new ones.
+    pub prev_log_index: u64,
+    /// Term of the entry at `prev_log_index`.
+    pub prev_log_term: u64,
+    /// Log entries to store (empty for heartbeat).
+    pub entries: Vec<LogEntry>,
+    /// Leader's `commit_index`.
+    pub leader_commit: u64,
+}
+
+/// Response to RequestVote RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestVoteResponse {
+    /// Current term, for the candidate to update itself.
+    pub term: u64,
+    /// True if the recipient voted for the candidate.
+    pub vote_granted: bool,
+}
+
+/// Response to AppendEntries RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEntriesResponse {
+    /// Current term, for the leader to update itself.
+    pub term: u64,
+    /// True if follower contained an entry matching `prev_log_index` and `prev_log_term`.
+    pub success: bool,
+}
+
 /// One server's Raft state and leader replication progress.
 #[derive(Debug, Clone)]
 pub struct RaftNode {
@@ -91,25 +148,40 @@ impl RaftNode {
     }
 
     pub fn handle_request_vote(&mut self, request: RequestVote) -> RequestVoteResponse {
-        /// If the candidate's term is less than the current term, reject the vote.
         if request.term < self.term {
             return RequestVoteResponse {
                 term: self.term,
                 vote_granted: false,
             };
         }
-        /// If the candidate has not voted for anyone in the current term, or the candidate is the same as the voted for node, vote for the candidate in the request.
-        if self.voted_for.is_none() || self.voted_for.unwrap() == request.candidate_id {
+
+        if request.term > self.term {
+            self.term = request.term;
+            self.voted_for = None;
+        }
+        self.role = Role::Follower;
+
+        let up_to_date = Self::log_is_up_to_date(
+            request.last_log_term,
+            request.last_log_index,
+            self.last_log_term(),
+            self.last_log_index(),
+        );
+
+        if up_to_date
+            && (self.voted_for.is_none() || self.voted_for == Some(request.candidate_id))
+        {
             self.voted_for = Some(request.candidate_id);
-            return RequestVoteResponse {
+            RequestVoteResponse {
                 term: self.term,
                 vote_granted: true,
-            };
+            }
+        } else {
+            RequestVoteResponse {
+                term: self.term,
+                vote_granted: false,
+            }
         }
-        return RequestVoteResponse {
-            term: self.term,
-            vote_granted: false,
-        };
     }
 
     pub fn handle_append_entries(&mut self, request: AppendEntries) -> AppendEntriesResponse {
@@ -119,62 +191,52 @@ impl RaftNode {
                 success: false,
             };
         }
+
+        if request.term > self.term {
+            self.term = request.term;
+            self.voted_for = None;
+        }
+        self.role = Role::Follower;
+
+        if self.log_term_at(request.prev_log_index) != request.prev_log_term {
+            return AppendEntriesResponse {
+                term: self.term,
+                success: false,
+            };
+        }
+
+        for (i, entry) in request.entries.iter().enumerate() {
+            let index = request.prev_log_index + 1 + i as u64;
+            if index < self.log.len() as u64 {
+                if self.log[index as usize].term != entry.term {
+                    self.log.truncate(index as usize);
+                    self.log.extend_from_slice(&request.entries[i..]);
+                    break;
+                }
+            } else {
+                self.log.extend_from_slice(&request.entries[i..]);
+                break;
+            }
+        }
+
+        if request.leader_commit > self.commit_index {
+            self.commit_index = std::cmp::min(request.leader_commit, self.last_log_index());
+        }
+
+        AppendEntriesResponse {
+            term: self.term,
+            success: true,
+        }
     }
-}
 
-/// RPC messages exchanged between Raft servers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message {
-    RequestVote(RequestVote),
-    AppendEntries(AppendEntries),
-    RequestVoteResponse(RequestVoteResponse),
-    AppendEntriesResponse(AppendEntriesResponse),
-}
-
-/// RequestVote RPC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestVote {
-    /// Candidate's term.
-    pub term: u64,
-    /// Candidate requesting the vote.
-    pub candidate_id: u64,
-    /// Index of the candidate's last log entry.
-    pub last_log_index: u64,
-    /// Term of the candidate's last log entry.
-    pub last_log_term: u64,
-}
-
-/// AppendEntries RPC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendEntries {
-    /// Leader's term.
-    pub term: u64,
-    /// So followers can redirect clients.
-    pub leader_id: u64,
-    /// Index of the log entry immediately preceding the new ones.
-    pub prev_log_index: u64,
-    /// Term of the entry at `prev_log_index`.
-    pub prev_log_term: u64,
-    /// Log entries to store (empty for heartbeat).
-    pub entries: Vec<LogEntry>,
-    /// Leader's `commit_index`.
-    pub leader_commit: u64,
-}
-
-/// Response to RequestVote RPC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestVoteResponse {
-    /// Current term, for the candidate to update itself.
-    pub term: u64,
-    /// True if the recipient voted for the candidate.
-    pub vote_granted: bool,
-}
-
-/// Response to AppendEntries RPC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendEntriesResponse {
-    /// Current term, for the leader to update itself.
-    pub term: u64,
-    /// True if follower contained an entry matching `prev_log_index` and `prev_log_term`.
-    pub success: bool,
+    fn log_is_up_to_date(
+        candidate_last_term: u64,
+        candidate_last_index: u64,
+        receiver_last_term: u64,
+        receiver_last_index: u64,
+    ) -> bool {
+        candidate_last_term > receiver_last_term
+            || (candidate_last_term == receiver_last_term
+                && candidate_last_index >= receiver_last_index)
+    }
 }
