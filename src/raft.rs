@@ -1,8 +1,26 @@
 //! Core Raft node state and RPC message types.
 //!
-//! Models persistent/volatile state and RPC messages from the Raft paper.
+//! # Implementation status
+//!
+//! **Done**
+//! - Node state, log sentinel, RPC message types
+//! - Follower: `handle_request_vote`, `handle_append_entries`
+//! - Election timer, `Action` enum, `start_election`, `handle_request_vote_response`
+//! - Leader: initial heartbeats on election win
+//!
+//! **Not yet implemented**
+//! - Leader: `propose`, `handle_append_entries_response`, periodic heartbeats
+//! - Apply loop: advance `last_applied` for committed entries
+//! - Deterministic simulator (`simulator.rs`)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Side effects produced by a node step for the simulator to execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Deliver an RPC message to another node.
+    Send { to: u64, msg: Message },
+}
 
 /// A node's role in the cluster at a given moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +127,23 @@ pub struct RaftNode {
     pub next_index: HashMap<u64, u64>,
     /// (Volatile) Per-follower highest replicated index (leader only).
     pub match_index: HashMap<u64, u64>,
-    /// Peer IDs in the cluster.
+    /// Peer IDs in the cluster (excludes self).
     pub peer_ids: Vec<u64>,
+    /// (Volatile) Ticks to wait before starting an election when not leader.
+    pub election_timeout: u64,
+    /// (Volatile) Simulator tick at which the election timer fires.
+    pub election_deadline: u64,
+    /// (Volatile) Peers that granted a vote to this candidate in the current term.
+    pub votes_granted: HashSet<u64>,
 }
 
 impl RaftNode {
     pub fn new(id: u64, peer_ids: Vec<u64>) -> Self {
-        Self {
+        Self::with_election_timeout(id, peer_ids, 150)
+    }
+
+    pub fn with_election_timeout(id: u64, peer_ids: Vec<u64>, election_timeout: u64) -> Self {
+        let mut node = Self {
             id,
             term: 0,
             role: Role::Follower,
@@ -126,7 +154,12 @@ impl RaftNode {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             peer_ids,
-        }
+            election_timeout,
+            election_deadline: 0,
+            votes_granted: HashSet::new(),
+        };
+        node.reset_election_timer(0);
+        node
     }
 
     /// Raft index of the last log entry.
@@ -147,7 +180,27 @@ impl RaftNode {
             .unwrap_or(0)
     }
 
-    pub fn handle_request_vote(&mut self, request: RequestVote) -> RequestVoteResponse {
+    /// Returns true if a follower/candidate should start an election at `now`.
+    pub fn election_timed_out(&self, now: u64) -> bool {
+        self.role != Role::Leader && now >= self.election_deadline
+    }
+
+    /// Start an election after the timer fires. Returns outbound actions for the simulator.
+    pub fn on_election_timeout(&mut self, now: u64) -> Vec<Action> {
+        if !self.election_timed_out(now) {
+            return Vec::new();
+        }
+        self.start_election(now)
+    }
+
+    /// Transition to candidate, request votes, and become leader immediately if alone in the cluster.
+    pub fn start_election(&mut self, now: u64) -> Vec<Action> {
+        self.become_candidate(now)
+    }
+
+    /// Handle an incoming RequestVote RPC (follower/candidate side).
+    pub fn handle_request_vote(&mut self, now: u64, request: RequestVote) -> RequestVoteResponse {
+        // 1. Reject if the candidate's term is stale.
         if request.term < self.term {
             return RequestVoteResponse {
                 term: self.term,
@@ -155,12 +208,17 @@ impl RaftNode {
             };
         }
 
+        // 2. If the candidate's term is newer, update local term and clear vote.
         if request.term > self.term {
-            self.term = request.term;
-            self.voted_for = None;
+            self.become_follower(request.term, now);
         }
+        // 3. Valid RPC from a candidate → remain/step down to follower.
         self.role = Role::Follower;
+        self.votes_granted.clear();
+        // 4. Reset election timer on any non-stale RequestVote RPC.
+        self.reset_election_timer(now);
 
+        // 5. Grant vote only if the candidate's log is at least as up-to-date as ours.
         let up_to_date = Self::log_is_up_to_date(
             request.last_log_term,
             request.last_log_index,
@@ -168,6 +226,7 @@ impl RaftNode {
             self.last_log_index(),
         );
 
+        // 6. Grant vote if we haven't voted yet, or already voted for this candidate.
         if up_to_date
             && (self.voted_for.is_none() || self.voted_for == Some(request.candidate_id))
         {
@@ -184,7 +243,13 @@ impl RaftNode {
         }
     }
 
-    pub fn handle_append_entries(&mut self, request: AppendEntries) -> AppendEntriesResponse {
+    /// Handle an incoming AppendEntries RPC (follower side).
+    pub fn handle_append_entries(
+        &mut self,
+        now: u64,
+        request: AppendEntries,
+    ) -> AppendEntriesResponse {
+        // 1. Reject if the leader's term is stale.
         if request.term < self.term {
             return AppendEntriesResponse {
                 term: self.term,
@@ -192,12 +257,15 @@ impl RaftNode {
             };
         }
 
+        // 2. If the leader's term is newer, update local term and clear vote.
         if request.term > self.term {
-            self.term = request.term;
-            self.voted_for = None;
+            self.become_follower(request.term, now);
         }
+        // 3. Valid RPC from a leader → remain/step down to follower.
         self.role = Role::Follower;
+        self.votes_granted.clear();
 
+        // 4. Reject if the log doesn't contain a matching entry at prev_log_index.
         if self.log_term_at(request.prev_log_index) != request.prev_log_term {
             return AppendEntriesResponse {
                 term: self.term,
@@ -205,6 +273,10 @@ impl RaftNode {
             };
         }
 
+        // 5. Reset election timer on successful AppendEntries (including heartbeats).
+        self.reset_election_timer(now);
+
+        // 6. On conflict (same index, different term), truncate the suffix and append new entries.
         for (i, entry) in request.entries.iter().enumerate() {
             let index = request.prev_log_index + 1 + i as u64;
             if index < self.log.len() as u64 {
@@ -219,9 +291,12 @@ impl RaftNode {
             }
         }
 
+        // 7. Advance commit_index if the leader has committed further (capped by our log length).
         if request.leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(request.leader_commit, self.last_log_index());
         }
+
+        // TODO: apply newly committed entries (advance last_applied)
 
         AppendEntriesResponse {
             term: self.term,
@@ -229,6 +304,126 @@ impl RaftNode {
         }
     }
 
+    /// Handle a RequestVote response (candidate side).
+    pub fn handle_request_vote_response(
+        &mut self,
+        now: u64,
+        from: u64,
+        response: RequestVoteResponse,
+    ) -> Vec<Action> {
+        // 1. If the response carries a newer term, step down to follower.
+        if response.term > self.term {
+            self.become_follower(response.term, now);
+            return Vec::new();
+        }
+
+        // 2. Ignore stale responses or replies when not a candidate.
+        if self.role != Role::Candidate || response.term < self.term {
+            return Vec::new();
+        }
+
+        // 3. Count granted votes; become leader on a majority.
+        if response.vote_granted {
+            self.votes_granted.insert(from);
+            if self.has_election_majority() {
+                return self.become_leader(now);
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Build heartbeat AppendEntries messages for all peers.
+    pub fn send_heartbeats(&self) -> Vec<Action> {
+        let heartbeat = AppendEntries {
+            term: self.term,
+            leader_id: self.id,
+            prev_log_index: self.last_log_index(),
+            prev_log_term: self.last_log_term(),
+            entries: vec![],
+            leader_commit: self.commit_index,
+        };
+
+        self.peer_ids
+            .iter()
+            .map(|&to| Action::Send {
+                to,
+                msg: Message::AppendEntries(heartbeat.clone()),
+            })
+            .collect()
+    }
+
+    fn become_follower(&mut self, term: u64, now: u64) {
+        self.term = term;
+        self.role = Role::Follower;
+        self.voted_for = None;
+        self.votes_granted.clear();
+        self.next_index.clear();
+        self.match_index.clear();
+        self.reset_election_timer(now);
+    }
+
+    fn become_candidate(&mut self, now: u64) -> Vec<Action> {
+        self.role = Role::Candidate;
+        self.term += 1;
+        self.voted_for = Some(self.id);
+        self.votes_granted.clear();
+        self.votes_granted.insert(self.id);
+        self.next_index.clear();
+        self.match_index.clear();
+        self.reset_election_timer(now);
+
+        if self.has_election_majority() {
+            return self.become_leader(now);
+        }
+
+        self.request_vote_actions()
+    }
+
+    fn become_leader(&mut self, _now: u64) -> Vec<Action> {
+        self.role = Role::Leader;
+        self.votes_granted.clear();
+
+        let next = self.last_log_index() + 1;
+        for &peer in &self.peer_ids {
+            self.next_index.insert(peer, next);
+            self.match_index.insert(peer, 0);
+        }
+
+        self.send_heartbeats()
+    }
+
+    fn request_vote_actions(&self) -> Vec<Action> {
+        let request = RequestVote {
+            term: self.term,
+            candidate_id: self.id,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
+        };
+
+        self.peer_ids
+            .iter()
+            .map(|&to| Action::Send {
+                to,
+                msg: Message::RequestVote(request.clone()),
+            })
+            .collect()
+    }
+
+    fn reset_election_timer(&mut self, now: u64) {
+        self.election_deadline = now + self.election_timeout;
+    }
+
+    fn cluster_size(&self) -> usize {
+        self.peer_ids.len() + 1
+    }
+
+    fn has_election_majority(&self) -> bool {
+        self.votes_granted.len() >= self.cluster_size() / 2 + 1
+    }
+
+    /// Returns true if the candidate log is at least as up-to-date as the receiver log.
+    /// Compare `(last_log_term, last_log_index)` lexicographically.
     fn log_is_up_to_date(
         candidate_last_term: u64,
         candidate_last_index: u64,
