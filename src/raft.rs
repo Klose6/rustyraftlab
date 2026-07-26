@@ -7,11 +7,11 @@
 //! - Follower: `handle_request_vote`, `handle_append_entries`
 //! - Election timer, `Action` enum, `start_election`, `handle_request_vote_response`
 //! - Leader: initial heartbeats on election win
+//! - Deterministic simulator (`simulator.rs`)
 //!
 //! **Not yet implemented**
 //! - Leader: `propose`, `handle_append_entries_response`, periodic heartbeats
 //! - Apply loop: advance `last_applied` for committed entries
-//! - Deterministic simulator (`simulator.rs`)
 
 use std::collections::{HashMap, HashSet};
 
