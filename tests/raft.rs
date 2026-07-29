@@ -180,6 +180,43 @@ fn append_entries_advances_commit_index() {
 
     assert!(response.success);
     assert_eq!(node.commit_index, 2);
+    assert_eq!(node.last_applied, 2);
+    assert_eq!(node.applied, vec![b"a".to_vec(), b"b".to_vec()]);
+}
+
+#[test]
+fn propose_rejected_when_not_leader() {
+    let mut node = RaftNode::new(1, vec![2]);
+
+    let err = node.propose(b"cmd".to_vec()).unwrap_err();
+    assert_eq!(err, rustyraftlab::raft::ProposeError::NotLeader);
+}
+
+#[test]
+fn leader_commits_and_applies_after_majority_replication() {
+    let mut leader = RaftNode::new(1, vec![2, 3]);
+    leader.role = Role::Leader;
+    leader.term = 1;
+    leader.next_index.insert(2, 1);
+    leader.next_index.insert(3, 1);
+    leader.match_index.insert(2, 0);
+    leader.match_index.insert(3, 0);
+
+    leader.propose(b"set x=1".to_vec()).unwrap();
+    assert_eq!(leader.last_log_index(), 1);
+
+    leader.handle_append_entries_response(
+        0,
+        2,
+        rustyraftlab::raft::AppendEntriesResponse {
+            term: 1,
+            success: true,
+        },
+    );
+
+    assert_eq!(leader.commit_index, 1);
+    assert_eq!(leader.last_applied, 1);
+    assert_eq!(leader.applied, vec![b"set x=1".to_vec()]);
 }
 
 #[test]
@@ -262,6 +299,38 @@ fn election_timeout_triggers_election() {
         Action::Send {
             to: 2,
             msg: Message::RequestVote(_)
+        }
+    ));
+}
+
+#[test]
+fn leader_sends_heartbeats_when_due() {
+    let mut node = RaftNode::with_election_timeout(1, vec![2, 3], 150);
+    node.start_election(100);
+
+    let actions = node.handle_request_vote_response(
+        100,
+        2,
+        RequestVoteResponse {
+            term: 1,
+            vote_granted: true,
+        },
+    );
+
+    assert_eq!(node.role, Role::Leader);
+    assert_eq!(actions.len(), 2);
+
+    assert!(!node.heartbeat_due(100));
+    let due_at = 100 + node.heartbeat_interval;
+    assert!(node.heartbeat_due(due_at));
+
+    let actions = node.on_heartbeat_tick(due_at);
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(
+        &actions[0],
+        Action::Send {
+            to: 2,
+            msg: Message::AppendEntries(_)
         }
     ));
 }

@@ -6,12 +6,9 @@
 //! - Node state, log sentinel, RPC message types
 //! - Follower: `handle_request_vote`, `handle_append_entries`
 //! - Election timer, `Action` enum, `start_election`, `handle_request_vote_response`
-//! - Leader: initial heartbeats on election win
-//! - Deterministic simulator (`simulator.rs`)
-//!
-//! **Not yet implemented**
-//! - Leader: `propose`, `handle_append_entries_response`, periodic heartbeats
+//! - Leader: heartbeats, `propose`, `handle_append_entries_response`
 //! - Apply loop: advance `last_applied` for committed entries
+//! - Deterministic simulator (`simulator.rs`)
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +17,14 @@ use std::collections::{HashMap, HashSet};
 pub enum Action {
     /// Deliver an RPC message to another node.
     Send { to: u64, msg: Message },
+    /// Apply a committed log entry to the state machine.
+    Apply { index: u64, data: Vec<u8> },
+}
+
+/// Error returned when a client command cannot be proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeError {
+    NotLeader,
 }
 
 /// A node's role in the cluster at a given moment.
@@ -135,6 +140,12 @@ pub struct RaftNode {
     pub election_deadline: u64,
     /// (Volatile) Peers that granted a vote to this candidate in the current term.
     pub votes_granted: HashSet<u64>,
+    /// (Volatile) Ticks between leader heartbeats (must be less than election timeout).
+    pub heartbeat_interval: u64,
+    /// (Volatile) Simulator tick at which the leader should send the next heartbeat.
+    pub heartbeat_deadline: u64,
+    /// (Volatile) Commands applied to the state machine in log order.
+    pub applied: Vec<Vec<u8>>,
 }
 
 impl RaftNode {
@@ -143,6 +154,7 @@ impl RaftNode {
     }
 
     pub fn with_election_timeout(id: u64, peer_ids: Vec<u64>, election_timeout: u64) -> Self {
+        let heartbeat_interval = (election_timeout / 3).max(1);
         let mut node = Self {
             id,
             term: 0,
@@ -157,6 +169,9 @@ impl RaftNode {
             election_timeout,
             election_deadline: 0,
             votes_granted: HashSet::new(),
+            heartbeat_interval,
+            heartbeat_deadline: 0,
+            applied: Vec::new(),
         };
         node.reset_election_timer(0);
         node
@@ -191,6 +206,20 @@ impl RaftNode {
             return Vec::new();
         }
         self.start_election(now)
+    }
+
+    /// Returns true if the leader should send heartbeats at `now`.
+    pub fn heartbeat_due(&self, now: u64) -> bool {
+        self.role == Role::Leader && now >= self.heartbeat_deadline
+    }
+
+    /// Send periodic heartbeats when due. Returns outbound actions for the simulator.
+    pub fn on_heartbeat_tick(&mut self, now: u64) -> Vec<Action> {
+        if !self.heartbeat_due(now) {
+            return Vec::new();
+        }
+        self.reset_heartbeat_timer(now);
+        self.send_heartbeats()
     }
 
     /// Transition to candidate, request votes, and become leader immediately if alone in the cluster.
@@ -296,7 +325,8 @@ impl RaftNode {
             self.commit_index = std::cmp::min(request.leader_commit, self.last_log_index());
         }
 
-        // TODO: apply newly committed entries (advance last_applied)
+        // 8. Apply newly committed entries to the state machine.
+        self.apply_committed_entries();
 
         AppendEntriesResponse {
             term: self.term,
@@ -333,24 +363,139 @@ impl RaftNode {
         Vec::new()
     }
 
-    /// Build heartbeat AppendEntries messages for all peers.
-    pub fn send_heartbeats(&self) -> Vec<Action> {
-        let heartbeat = AppendEntries {
-            term: self.term,
-            leader_id: self.id,
-            prev_log_index: self.last_log_index(),
-            prev_log_term: self.last_log_term(),
-            entries: vec![],
-            leader_commit: self.commit_index,
-        };
+    /// Append a client command to the log and replicate it to followers (leader only).
+    pub fn propose(&mut self, data: Vec<u8>) -> Result<Vec<Action>, ProposeError> {
+        if self.role != Role::Leader {
+            return Err(ProposeError::NotLeader);
+        }
 
+        self.log.push(LogEntry {
+            term: self.term,
+            data,
+        });
+
+        Ok(self.replication_actions())
+    }
+
+    /// Handle an AppendEntries response (leader side).
+    pub fn handle_append_entries_response(
+        &mut self,
+        now: u64,
+        from: u64,
+        response: AppendEntriesResponse,
+    ) -> Vec<Action> {
+        // 1. If the response carries a newer term, step down to follower.
+        if response.term > self.term {
+            self.become_follower(response.term, now);
+            return Vec::new();
+        }
+
+        // 2. Ignore stale responses or replies when not leader.
+        if self.role != Role::Leader || response.term < self.term {
+            return Vec::new();
+        }
+
+        let next_index = self.next_index.get(&from).copied().unwrap_or(1);
+
+        // 3. On success, advance follower progress and try to commit.
+        if response.success {
+            let matched = if next_index <= self.last_log_index() {
+                self.last_log_index()
+            } else {
+                next_index.saturating_sub(1)
+            };
+            self.match_index.insert(from, matched);
+            self.next_index.insert(from, matched + 1);
+            return self.advance_commit_index();
+        }
+
+        // 4. On failure, back up next_index and retry replication to this follower.
+        if next_index > 1 {
+            self.next_index.insert(from, next_index - 1);
+        }
+
+        vec![Action::Send {
+            to: from,
+            msg: Message::AppendEntries(self.append_entries_for_peer(from)),
+        }]
+    }
+
+    /// Build AppendEntries RPCs for all peers (heartbeats or replication).
+    pub fn replication_actions(&self) -> Vec<Action> {
         self.peer_ids
             .iter()
             .map(|&to| Action::Send {
                 to,
-                msg: Message::AppendEntries(heartbeat.clone()),
+                msg: Message::AppendEntries(self.append_entries_for_peer(to)),
             })
             .collect()
+    }
+
+    /// Build heartbeat AppendEntries messages for all peers.
+    pub fn send_heartbeats(&self) -> Vec<Action> {
+        self.replication_actions()
+    }
+
+    fn append_entries_for_peer(&self, peer: u64) -> AppendEntries {
+        let next_index = self.next_index.get(&peer).copied().unwrap_or(1);
+        let prev_log_index = next_index.saturating_sub(1);
+        let entries = if next_index <= self.last_log_index() {
+            self.log[next_index as usize..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        AppendEntries {
+            term: self.term,
+            leader_id: self.id,
+            prev_log_index,
+            prev_log_term: self.log_term_at(prev_log_index),
+            entries,
+            leader_commit: self.commit_index,
+        }
+    }
+
+    fn advance_commit_index(&mut self) -> Vec<Action> {
+        let old_commit_index = self.commit_index;
+
+        for index in (self.commit_index + 1)..=self.last_log_index() {
+            if self.log[index as usize].term != self.term {
+                continue;
+            }
+
+            let mut replicated = 1;
+            for &matched in self.match_index.values() {
+                if matched >= index {
+                    replicated += 1;
+                }
+            }
+
+            if replicated >= self.cluster_size() / 2 + 1 {
+                self.commit_index = index;
+            }
+        }
+
+        let mut actions = self.apply_committed_entries();
+        if self.commit_index > old_commit_index {
+            actions.extend(self.replication_actions());
+        }
+        actions
+    }
+
+    fn apply_committed_entries(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let data = self.log[self.last_applied as usize].data.clone();
+            self.applied.push(data.clone());
+            actions.push(Action::Apply {
+                index: self.last_applied,
+                data,
+            });
+        }
+
+        actions
     }
 
     fn become_follower(&mut self, term: u64, now: u64) {
@@ -380,7 +525,7 @@ impl RaftNode {
         self.request_vote_actions()
     }
 
-    fn become_leader(&mut self, _now: u64) -> Vec<Action> {
+    fn become_leader(&mut self, now: u64) -> Vec<Action> {
         self.role = Role::Leader;
         self.votes_granted.clear();
 
@@ -390,6 +535,7 @@ impl RaftNode {
             self.match_index.insert(peer, 0);
         }
 
+        self.reset_heartbeat_timer(now);
         self.send_heartbeats()
     }
 
@@ -412,6 +558,10 @@ impl RaftNode {
 
     fn reset_election_timer(&mut self, now: u64) {
         self.election_deadline = now + self.election_timeout;
+    }
+
+    fn reset_heartbeat_timer(&mut self, now: u64) {
+        self.heartbeat_deadline = now + self.heartbeat_interval;
     }
 
     fn cluster_size(&self) -> usize {

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::raft::{Action, AppendEntriesResponse, Message, RaftNode, Role};
+use crate::raft::{Action, Message, ProposeError, RaftNode, Role};
 
 /// A message waiting in the simulated network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,9 +86,18 @@ impl Simulator {
         self.partitions.remove(&(a.min(b), a.max(b)));
     }
 
-    /// Advance one tick: fire election timers, then deliver all pending messages.
+    /// Propose a command to the cluster through the given leader and deliver replication RPCs.
+    pub fn propose(&mut self, leader_id: u64, data: Vec<u8>) -> Result<(), ProposeError> {
+        let actions = self.node_mut(leader_id).propose(data)?;
+        self.enqueue_actions(leader_id, actions);
+        self.drain_inbox();
+        Ok(())
+    }
+
+    /// Advance one tick: leader heartbeats, election timers, then deliver pending messages.
     pub fn tick(&mut self) {
         self.tick += 1;
+        self.process_heartbeats();
         self.process_election_timeouts();
         self.drain_inbox();
     }
@@ -109,6 +118,15 @@ impl Simulator {
             }
         }
         None
+    }
+
+    fn process_heartbeats(&mut self) {
+        let now = self.tick;
+        let ids = self.node_ids();
+        for id in ids {
+            let actions = self.node_mut(id).on_heartbeat_tick(now);
+            self.enqueue_actions(id, actions);
+        }
     }
 
     fn process_election_timeouts(&mut self) {
@@ -166,24 +184,25 @@ impl Simulator {
                 self.actions_to_pending(to, actions)
             }
             Message::AppendEntriesResponse(response) => {
-                self.handle_append_entries_response(to, from, response);
+                let actions = self
+                    .node_mut(to)
+                    .handle_append_entries_response(now, from, response);
+                self.enqueue_actions(to, actions);
                 Vec::new()
             }
         }
     }
 
-    fn handle_append_entries_response(
-        &mut self,
-        _leader_id: u64,
-        _from: u64,
-        _response: AppendEntriesResponse,
-    ) {
-        // TODO: leader replication once handle_append_entries_response exists on RaftNode
-    }
-
     fn enqueue_actions(&mut self, from: u64, actions: Vec<Action>) {
-        for pending in self.actions_to_pending(from, actions) {
-            self.inbox.push_back(pending);
+        for action in actions {
+            match action {
+                Action::Send { to, msg } => {
+                    self.inbox.push_back(PendingMessage { from, to, msg });
+                }
+                Action::Apply { .. } => {
+                    // Already recorded on the node in apply_committed_entries.
+                }
+            }
         }
     }
 
@@ -192,6 +211,7 @@ impl Simulator {
             .into_iter()
             .filter_map(|action| match action {
                 Action::Send { to, msg } => Some(PendingMessage { from, to, msg }),
+                Action::Apply { .. } => None,
             })
             .collect()
     }

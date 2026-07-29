@@ -64,6 +64,36 @@ fn healing_partition_allows_isolated_node_to_catch_up() {
 }
 
 #[test]
+fn propose_replicates_and_applies_on_all_nodes() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+
+    sim.propose(leader, b"cmd1".to_vec())
+        .expect("proposal should succeed");
+
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).commit_index, 1);
+        assert_eq!(sim.node(id).last_applied, 1);
+        assert_eq!(sim.node(id).applied, vec![b"cmd1".to_vec()]);
+    }
+}
+
+#[test]
+fn periodic_heartbeats_maintain_leadership_over_long_run() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+
+    sim.run_ticks(1_000);
+
+    assert_eq!(sim.leaders(), vec![leader]);
+    for &id in &[1, 2, 3] {
+        if id != leader {
+            assert_eq!(sim.node(id).role, Role::Follower);
+        }
+    }
+}
+
+#[test]
 fn initial_heartbeats_keep_followers_from_electing_immediately() {
     let mut sim = Simulator::new(&[1, 2, 3], 150);
     let leader = sim.run_until_leader(500).expect("leader elected");
