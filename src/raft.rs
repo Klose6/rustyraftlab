@@ -8,7 +8,7 @@
 //! - Election timer, `Action` enum, `start_election`, `handle_request_vote_response`
 //! - Leader: heartbeats, `propose`, `handle_append_entries_response`
 //! - Apply loop: advance `last_applied` into the key-value state machine
-//! - Deterministic simulator (`simulator.rs`)
+//! - Deterministic simulator with partitions, delay, drops, and crash/restart
 
 use crate::state_machine::{Command, StateMachine};
 
@@ -150,6 +150,14 @@ pub struct RaftNode {
     pub state_machine: StateMachine,
 }
 
+/// Persistent Raft state preserved across a simulated crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentState {
+    pub term: u64,
+    pub voted_for: Option<u64>,
+    pub log: Vec<LogEntry>,
+}
+
 impl RaftNode {
     pub fn new(id: u64, peer_ids: Vec<u64>) -> Self {
         Self::with_election_timeout(id, peer_ids, 150)
@@ -195,6 +203,35 @@ impl RaftNode {
             .get(index as usize)
             .map(|entry| entry.term)
             .unwrap_or(0)
+    }
+
+    /// Snapshot persistent state before a simulated crash.
+    pub fn snapshot_persistent(&self) -> PersistentState {
+        PersistentState {
+            term: self.term,
+            voted_for: self.voted_for,
+            log: self.log.clone(),
+        }
+    }
+
+    /// Restore persistent state after a simulated restart.
+    pub fn restore_persistent(&mut self, persistent: PersistentState) {
+        self.term = persistent.term;
+        self.voted_for = persistent.voted_for;
+        self.log = persistent.log;
+    }
+
+    /// Reset volatile state after a crash; the node catches up from the leader afterward.
+    pub fn reset_volatile_after_crash(&mut self, now: u64) {
+        self.role = Role::Follower;
+        self.commit_index = 0;
+        self.last_applied = 0;
+        self.next_index.clear();
+        self.match_index.clear();
+        self.votes_granted.clear();
+        self.state_machine = StateMachine::new();
+        self.reset_election_timer(now);
+        self.heartbeat_deadline = now + self.heartbeat_interval;
     }
 
     /// Returns true if a follower/candidate should start an election at `now`.

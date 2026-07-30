@@ -1,11 +1,11 @@
 //! Deterministic fault-injection simulator for Raft correctness testing.
 //!
 //! The simulator owns all nodes, advances a global tick counter, delivers RPC
-//! messages synchronously from an inbox, and optionally blocks links between nodes.
+//! messages through an inbox, and supports partitions, delay, drops, and crashes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::raft::{Action, Message, ProposeError, RaftNode, Role};
+use crate::raft::{Action, Message, PersistentState, ProposeError, RaftNode, Role};
 use crate::state_machine::Command;
 
 /// A message waiting in the simulated network.
@@ -14,16 +14,28 @@ struct PendingMessage {
     from: u64,
     to: u64,
     msg: Message,
+    deliver_at: u64,
 }
 
-/// In-memory multi-node Raft cluster with deterministic timing.
+/// In-memory multi-node Raft cluster with deterministic timing and faults.
 #[derive(Debug)]
 pub struct Simulator {
     tick: u64,
     nodes: HashMap<u64, RaftNode>,
     inbox: VecDeque<PendingMessage>,
+    delayed: VecDeque<PendingMessage>,
     /// Undirected pairs of nodes that cannot exchange messages.
     partitions: HashSet<(u64, u64)>,
+    /// Nodes that are currently down and ignore RPCs and timers.
+    crashed: HashSet<u64>,
+    /// Persistent state saved at crash time, restored on restart.
+    crash_snapshots: HashMap<u64, PersistentState>,
+    /// Ticks to wait before a newly enqueued message becomes deliverable.
+    message_delay_ticks: u64,
+    /// Deterministically drop every Nth enqueued message (`None` disables drops).
+    drop_every_nth: Option<u64>,
+    /// Counts enqueued messages for deterministic drops.
+    enqueue_count: u64,
 }
 
 impl Simulator {
@@ -41,7 +53,13 @@ impl Simulator {
             tick: 0,
             nodes,
             inbox: VecDeque::new(),
+            delayed: VecDeque::new(),
             partitions: HashSet::new(),
+            crashed: HashSet::new(),
+            crash_snapshots: HashMap::new(),
+            message_delay_ticks: 0,
+            drop_every_nth: None,
+            enqueue_count: 0,
         }
     }
 
@@ -63,16 +81,30 @@ impl Simulator {
         ids
     }
 
+    pub fn is_crashed(&self, id: u64) -> bool {
+        self.crashed.contains(&id)
+    }
+
+    /// Delay all newly enqueued messages by this many ticks.
+    pub fn set_message_delay(&mut self, ticks: u64) {
+        self.message_delay_ticks = ticks;
+    }
+
+    /// Drop every Nth enqueued message deterministically.
+    pub fn set_drop_every_nth(&mut self, n: Option<u64>) {
+        self.drop_every_nth = n.filter(|&value| value > 0);
+    }
+
     /// IDs of nodes currently in the leader role.
     pub fn leaders(&self) -> Vec<u64> {
         self.nodes
             .iter()
-            .filter(|(_, node)| node.role == Role::Leader)
+            .filter(|(&id, node)| !self.crashed.contains(&id) && node.role == Role::Leader)
             .map(|(&id, _)| id)
             .collect()
     }
 
-    /// Returns true when exactly one leader exists.
+    /// Returns true when exactly one live leader exists.
     pub fn has_stable_leader(&self) -> bool {
         self.leaders().len() == 1
     }
@@ -87,6 +119,35 @@ impl Simulator {
         self.partitions.remove(&(a.min(b), a.max(b)));
     }
 
+    /// Crash a node: save persistent state and stop processing RPCs and timers.
+    pub fn crash(&mut self, id: u64) {
+        if self.crashed.contains(&id) {
+            return;
+        }
+
+        let snapshot = self.node(id).snapshot_persistent();
+        self.crash_snapshots.insert(id, snapshot);
+        self.crashed.insert(id);
+    }
+
+    /// Restart a crashed node from its saved persistent state.
+    pub fn restart(&mut self, id: u64) {
+        assert!(self.crashed.contains(&id), "node must be crashed before restart");
+
+        let persistent = self
+            .crash_snapshots
+            .remove(&id)
+            .expect("missing crash snapshot");
+        let peer_ids = self.node(id).peer_ids.clone();
+        let election_timeout = self.node(id).election_timeout;
+
+        let mut node = RaftNode::with_election_timeout(id, peer_ids, election_timeout);
+        node.restore_persistent(persistent);
+        node.reset_volatile_after_crash(self.tick);
+        self.nodes.insert(id, node);
+        self.crashed.remove(&id);
+    }
+
     /// Propose a command to the cluster through the given leader and deliver replication RPCs.
     pub fn propose_command(&mut self, leader_id: u64, command: Command) -> Result<(), ProposeError> {
         let actions = self.node_mut(leader_id).propose_command(command)?;
@@ -95,15 +156,20 @@ impl Simulator {
         Ok(())
     }
 
-    /// Returns true if every node has the same state machine contents.
+    /// Returns true if every live node has the same state machine contents.
     pub fn cluster_state_matches(&self) -> bool {
-        let ids = self.node_ids();
-        let Some(first) = ids.first().copied() else {
+        let live_ids: Vec<_> = self
+            .node_ids()
+            .into_iter()
+            .filter(|id| !self.crashed.contains(id))
+            .collect();
+        let Some(first) = live_ids.first().copied() else {
             return true;
         };
 
         let expected = self.node(first).state_machine.clone();
-        ids.iter()
+        live_ids
+            .iter()
             .skip(1)
             .all(|&id| self.node(id).state_machine == expected)
     }
@@ -116,9 +182,15 @@ impl Simulator {
         Ok(())
     }
 
-    /// Advance one tick: leader heartbeats, election timers, then deliver pending messages.
+    /// Number of messages waiting for a future tick.
+    pub fn delayed_message_count(&self) -> usize {
+        self.delayed.len()
+    }
+
+    /// Advance one tick: release delayed messages, heartbeats, election timers, deliver inbox.
     pub fn tick(&mut self) {
         self.tick += 1;
+        self.release_delayed_messages();
         self.process_heartbeats();
         self.process_election_timeouts();
         self.drain_inbox();
@@ -131,7 +203,7 @@ impl Simulator {
         }
     }
 
-    /// Run until `has_stable_leader` or `max_ticks` is reached. Returns the leader ID if found.
+    /// Run until one live leader exists or `max_ticks` is reached.
     pub fn run_until_leader(&mut self, max_ticks: u64) -> Option<u64> {
         for _ in 0..max_ticks {
             self.tick();
@@ -142,9 +214,29 @@ impl Simulator {
         None
     }
 
+    fn release_delayed_messages(&mut self) {
+        let now = self.tick;
+        let mut still_delayed = VecDeque::new();
+
+        while let Some(pending) = self.delayed.pop_front() {
+            if pending.deliver_at <= now {
+                self.inbox.push_back(pending);
+            } else {
+                still_delayed.push_back(pending);
+            }
+        }
+
+        self.delayed = still_delayed;
+    }
+
     fn process_heartbeats(&mut self) {
         let now = self.tick;
-        let ids = self.node_ids();
+        let ids = self
+            .node_ids()
+            .into_iter()
+            .filter(|id| !self.crashed.contains(id))
+            .collect::<Vec<_>>();
+
         for id in ids {
             let actions = self.node_mut(id).on_heartbeat_tick(now);
             self.enqueue_actions(id, actions);
@@ -153,7 +245,12 @@ impl Simulator {
 
     fn process_election_timeouts(&mut self) {
         let now = self.tick;
-        let ids: Vec<u64> = self.node_ids();
+        let ids = self
+            .node_ids()
+            .into_iter()
+            .filter(|id| !self.crashed.contains(id))
+            .collect::<Vec<_>>();
+
         for id in ids {
             let actions = {
                 let node = self.node_mut(id);
@@ -169,14 +266,21 @@ impl Simulator {
 
     fn drain_inbox(&mut self) {
         while let Some(pending) = self.inbox.pop_front() {
-            if self.is_partitioned(pending.from, pending.to) {
+            if self.should_drop_message(&pending) {
                 continue;
             }
+
             let replies = self.deliver(pending.from, pending.to, pending.msg);
             for reply in replies {
-                self.inbox.push_back(reply);
+                self.enqueue_message(reply);
             }
         }
+    }
+
+    fn should_drop_message(&self, pending: &PendingMessage) -> bool {
+        self.crashed.contains(&pending.from)
+            || self.crashed.contains(&pending.to)
+            || self.is_partitioned(pending.from, pending.to)
     }
 
     fn deliver(&mut self, from: u64, to: u64, msg: Message) -> Vec<PendingMessage> {
@@ -189,6 +293,7 @@ impl Simulator {
                     from: to,
                     to: from,
                     msg: Message::RequestVoteResponse(response),
+                    deliver_at: now,
                 }]
             }
             Message::AppendEntries(request) => {
@@ -197,13 +302,15 @@ impl Simulator {
                     from: to,
                     to: from,
                     msg: Message::AppendEntriesResponse(response),
+                    deliver_at: now,
                 }]
             }
             Message::RequestVoteResponse(response) => {
                 let actions = self
                     .node_mut(to)
                     .handle_request_vote_response(now, from, response);
-                self.actions_to_pending(to, actions)
+                self.enqueue_actions(to, actions);
+                Vec::new()
             }
             Message::AppendEntriesResponse(response) => {
                 let actions = self
@@ -219,7 +326,12 @@ impl Simulator {
         for action in actions {
             match action {
                 Action::Send { to, msg } => {
-                    self.inbox.push_back(PendingMessage { from, to, msg });
+                    self.enqueue_message(PendingMessage {
+                        from,
+                        to,
+                        msg,
+                        deliver_at: self.tick,
+                    });
                 }
                 Action::Apply { .. } => {
                     // Already applied on the node in apply_committed_entries.
@@ -228,14 +340,21 @@ impl Simulator {
         }
     }
 
-    fn actions_to_pending(&self, from: u64, actions: Vec<Action>) -> Vec<PendingMessage> {
-        actions
-            .into_iter()
-            .filter_map(|action| match action {
-                Action::Send { to, msg } => Some(PendingMessage { from, to, msg }),
-                Action::Apply { .. } => None,
-            })
-            .collect()
+    fn enqueue_message(&mut self, mut pending: PendingMessage) {
+        self.enqueue_count += 1;
+        if self
+            .drop_every_nth
+            .is_some_and(|n| self.enqueue_count % n == 0)
+        {
+            return;
+        }
+
+        if self.message_delay_ticks > 0 {
+            pending.deliver_at = self.tick + self.message_delay_ticks;
+            self.delayed.push_back(pending);
+        } else {
+            self.inbox.push_back(pending);
+        }
     }
 
     fn is_partitioned(&self, a: u64, b: u64) -> bool {

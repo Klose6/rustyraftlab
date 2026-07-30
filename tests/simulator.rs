@@ -166,3 +166,92 @@ fn partitioned_node_catches_up_state_after_heal() {
         assert_eq!(sim.node(id).state_machine.get("k"), Some("v"));
     }
 }
+
+#[test]
+fn message_delay_defers_replication_until_ticks_pass() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+    sim.set_message_delay(20);
+
+    sim.propose_command(leader, Command::set("delayed", "yes"))
+        .expect("proposal enqueued");
+
+    assert!(
+        sim.delayed_message_count() > 0 || sim.node(2).commit_index == 0,
+        "replication should not complete instantly with delay"
+    );
+
+    sim.run_ticks(60);
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).state_machine.get("delayed"), Some("yes"));
+    }
+}
+
+#[test]
+fn crashed_follower_recovers_after_restart() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+
+    sim.propose_command(leader, Command::set("before", "1"))
+        .expect("initial commit");
+
+    sim.crash(3);
+    sim.propose_command(leader, Command::set("after", "2"))
+        .expect("majority commit while node 3 is down");
+
+    sim.restart(3);
+    sim.run_ticks(300);
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).state_machine.get("before"), Some("1"));
+        assert_eq!(sim.node(id).state_machine.get("after"), Some("2"));
+    }
+}
+
+#[test]
+fn crashed_leader_is_replaced_and_restarted_node_catches_up() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+
+    sim.propose_command(leader, Command::set("k1", "v1"))
+        .expect("initial commit");
+
+    sim.crash(leader);
+    sim.run_ticks(500);
+
+    let new_leader = [1, 2, 3]
+        .into_iter()
+        .find(|&id| !sim.is_crashed(id) && sim.node(id).role == Role::Leader)
+        .expect("remaining nodes should elect a leader");
+
+    sim.propose_command(new_leader, Command::set("k2", "v2"))
+        .expect("commit after leader crash");
+
+    sim.restart(leader);
+    sim.run_ticks(400);
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).state_machine.get("k1"), Some("v1"));
+        assert_eq!(sim.node(id).state_machine.get("k2"), Some("v2"));
+    }
+}
+
+#[test]
+fn dropped_messages_still_converge_with_enough_ticks() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+    sim.set_drop_every_nth(Some(5));
+
+    sim.propose_command(leader, Command::set("dropped", "ok"))
+        .expect("proposal sent");
+    sim.run_ticks(1_000);
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).state_machine.get("dropped"), Some("ok"));
+    }
+}
