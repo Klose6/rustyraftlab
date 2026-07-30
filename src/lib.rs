@@ -2,3 +2,4 @@
 
 pub mod raft;
 pub mod simulator;
+pub mod state_machine;

@@ -1,11 +1,12 @@
 use rustyraftlab::raft::{
     Action, AppendEntries, LogEntry, Message, RaftNode, RequestVote, RequestVoteResponse, Role,
 };
+use rustyraftlab::state_machine::Command;
 
-fn entry(term: u64, data: &str) -> LogEntry {
+fn encoded_entry(term: u64, command: Command) -> LogEntry {
     LogEntry {
         term,
-        data: data.as_bytes().to_vec(),
+        data: command.encode(),
     }
 }
 
@@ -77,7 +78,10 @@ fn rejects_if_already_voted_for_other() {
 
 #[test]
 fn rejects_less_up_to_date_candidate() {
-    let mut node = node_with_log(1, vec![entry(2, "a"), entry(2, "b")]);
+    let mut node = node_with_log(1, vec![
+        encoded_entry(2, Command::set("a", "1")),
+        encoded_entry(2, Command::set("b", "2")),
+    ]);
     node.term = 2;
 
     let response = node.handle_request_vote(
@@ -108,7 +112,7 @@ fn append_entries_rejects_stale_term() {
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![],
-            leader_commit: 0,
+            leader_commit_index: 0,
         },
     );
 
@@ -128,7 +132,7 @@ fn append_entries_accepts_heartbeat() {
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![],
-            leader_commit: 0,
+            leader_commit_index: 0,
         },
     );
 
@@ -141,7 +145,11 @@ fn append_entries_accepts_heartbeat() {
 
 #[test]
 fn append_entries_truncates_conflicting_suffix() {
-    let mut node = node_with_log(1, vec![entry(1, "a"), entry(1, "b"), entry(1, "c")]);
+    let mut node = node_with_log(1, vec![
+        encoded_entry(1, Command::set("a", "1")),
+        encoded_entry(1, Command::set("b", "2")),
+        encoded_entry(1, Command::set("c", "3")),
+    ]);
 
     let response = node.handle_append_entries(
         0,
@@ -150,21 +158,27 @@ fn append_entries_truncates_conflicting_suffix() {
             leader_id: 2,
             prev_log_index: 1,
             prev_log_term: 1,
-            entries: vec![entry(2, "b2"), entry(2, "d")],
-            leader_commit: 0,
+            entries: vec![
+                encoded_entry(2, Command::set("b", "2")),
+                encoded_entry(2, Command::set("d", "4")),
+            ],
+            leader_commit_index: 0,
         },
     );
 
     assert!(response.success);
     assert_eq!(node.log.len(), 4);
-    assert_eq!(node.log[1], entry(1, "a"));
-    assert_eq!(node.log[2], entry(2, "b2"));
-    assert_eq!(node.log[3], entry(2, "d"));
+    assert_eq!(node.log[1], encoded_entry(1, Command::set("a", "1")));
+    assert_eq!(node.log[2], encoded_entry(2, Command::set("b", "2")));
+    assert_eq!(node.log[3], encoded_entry(2, Command::set("d", "4")));
 }
 
 #[test]
-fn append_entries_advances_commit_index() {
-    let mut node = node_with_log(1, vec![entry(1, "a"), entry(1, "b")]);
+fn append_entries_advances_commit_index_and_applies_commands() {
+    let mut node = node_with_log(1, vec![
+        encoded_entry(1, Command::set("a", "1")),
+        encoded_entry(1, Command::set("b", "2")),
+    ]);
 
     let response = node.handle_append_entries(
         0,
@@ -174,14 +188,22 @@ fn append_entries_advances_commit_index() {
             prev_log_index: 2,
             prev_log_term: 1,
             entries: vec![],
-            leader_commit: 2,
+            leader_commit_index: 2,
         },
     );
 
     assert!(response.success);
     assert_eq!(node.commit_index, 2);
     assert_eq!(node.last_applied, 2);
-    assert_eq!(node.applied, vec![b"a".to_vec(), b"b".to_vec()]);
+    assert_eq!(node.state_machine.get("a"), Some("1"));
+    assert_eq!(node.state_machine.get("b"), Some("2"));
+    assert_eq!(
+        node.state_machine.applied_commands(),
+        &[
+            Command::set("a", "1"),
+            Command::set("b", "2"),
+        ]
+    );
 }
 
 #[test]
@@ -202,7 +224,9 @@ fn leader_commits_and_applies_after_majority_replication() {
     leader.match_index.insert(2, 0);
     leader.match_index.insert(3, 0);
 
-    leader.propose(b"set x=1".to_vec()).unwrap();
+    leader
+        .propose_command(Command::set("x", "1"))
+        .unwrap();
     assert_eq!(leader.last_log_index(), 1);
 
     leader.handle_append_entries_response(
@@ -216,7 +240,7 @@ fn leader_commits_and_applies_after_majority_replication() {
 
     assert_eq!(leader.commit_index, 1);
     assert_eq!(leader.last_applied, 1);
-    assert_eq!(leader.applied, vec![b"set x=1".to_vec()]);
+    assert_eq!(leader.state_machine.get("x"), Some("1"));
 }
 
 #[test]

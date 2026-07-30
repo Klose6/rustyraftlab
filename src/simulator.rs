@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::raft::{Action, Message, ProposeError, RaftNode, Role};
+use crate::state_machine::Command;
 
 /// A message waiting in the simulated network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,27 @@ impl Simulator {
     }
 
     /// Propose a command to the cluster through the given leader and deliver replication RPCs.
+    pub fn propose_command(&mut self, leader_id: u64, command: Command) -> Result<(), ProposeError> {
+        let actions = self.node_mut(leader_id).propose_command(command)?;
+        self.enqueue_actions(leader_id, actions);
+        self.drain_inbox();
+        Ok(())
+    }
+
+    /// Returns true if every node has the same state machine contents.
+    pub fn cluster_state_matches(&self) -> bool {
+        let ids = self.node_ids();
+        let Some(first) = ids.first().copied() else {
+            return true;
+        };
+
+        let expected = self.node(first).state_machine.clone();
+        ids.iter()
+            .skip(1)
+            .all(|&id| self.node(id).state_machine == expected)
+    }
+
+    /// Propose raw log bytes to the cluster through the given leader.
     pub fn propose(&mut self, leader_id: u64, data: Vec<u8>) -> Result<(), ProposeError> {
         let actions = self.node_mut(leader_id).propose(data)?;
         self.enqueue_actions(leader_id, actions);
@@ -200,7 +222,7 @@ impl Simulator {
                     self.inbox.push_back(PendingMessage { from, to, msg });
                 }
                 Action::Apply { .. } => {
-                    // Already recorded on the node in apply_committed_entries.
+                    // Already applied on the node in apply_committed_entries.
                 }
             }
         }

@@ -7,8 +7,10 @@
 //! - Follower: `handle_request_vote`, `handle_append_entries`
 //! - Election timer, `Action` enum, `start_election`, `handle_request_vote_response`
 //! - Leader: heartbeats, `propose`, `handle_append_entries_response`
-//! - Apply loop: advance `last_applied` for committed entries
+//! - Apply loop: advance `last_applied` into the key-value state machine
 //! - Deterministic simulator (`simulator.rs`)
+
+use crate::state_machine::{Command, StateMachine};
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,7 +20,7 @@ pub enum Action {
     /// Deliver an RPC message to another node.
     Send { to: u64, msg: Message },
     /// Apply a committed log entry to the state machine.
-    Apply { index: u64, data: Vec<u8> },
+    Apply { index: u64, command: Command },
 }
 
 /// Error returned when a client command cannot be proposed.
@@ -90,7 +92,7 @@ pub struct AppendEntries {
     /// Log entries to store (empty for heartbeat).
     pub entries: Vec<LogEntry>,
     /// Leader's `commit_index`.
-    pub leader_commit: u64,
+    pub leader_commit_index: u64,
 }
 
 /// Response to RequestVote RPC.
@@ -144,8 +146,8 @@ pub struct RaftNode {
     pub heartbeat_interval: u64,
     /// (Volatile) Simulator tick at which the leader should send the next heartbeat.
     pub heartbeat_deadline: u64,
-    /// (Volatile) Commands applied to the state machine in log order.
-    pub applied: Vec<Vec<u8>>,
+    /// (Volatile) Key-value state machine updated from committed log entries.
+    pub state_machine: StateMachine,
 }
 
 impl RaftNode {
@@ -171,7 +173,7 @@ impl RaftNode {
             votes_granted: HashSet::new(),
             heartbeat_interval,
             heartbeat_deadline: 0,
-            applied: Vec::new(),
+            state_machine: StateMachine::new(),
         };
         node.reset_election_timer(0);
         node
@@ -321,8 +323,8 @@ impl RaftNode {
         }
 
         // 7. Advance commit_index if the leader has committed further (capped by our log length).
-        if request.leader_commit > self.commit_index {
-            self.commit_index = std::cmp::min(request.leader_commit, self.last_log_index());
+        if request.leader_commit_index > self.commit_index {
+            self.commit_index = std::cmp::min(request.leader_commit_index, self.last_log_index());
         }
 
         // 8. Apply newly committed entries to the state machine.
@@ -364,6 +366,11 @@ impl RaftNode {
     }
 
     /// Append a client command to the log and replicate it to followers (leader only).
+    pub fn propose_command(&mut self, command: Command) -> Result<Vec<Action>, ProposeError> {
+        self.propose(command.encode())
+    }
+
+    /// Append raw log bytes to the log and replicate them to followers (leader only).
     pub fn propose(&mut self, data: Vec<u8>) -> Result<Vec<Action>, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader);
@@ -451,7 +458,7 @@ impl RaftNode {
             prev_log_index,
             prev_log_term: self.log_term_at(prev_log_index),
             entries,
-            leader_commit: self.commit_index,
+            leader_commit_index: self.commit_index,
         }
     }
 
@@ -487,11 +494,12 @@ impl RaftNode {
 
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let data = self.log[self.last_applied as usize].data.clone();
-            self.applied.push(data.clone());
+            let data = &self.log[self.last_applied as usize].data;
+            let command = Command::decode(data).expect("committed entry must decode");
+            self.state_machine.apply(&command);
             actions.push(Action::Apply {
                 index: self.last_applied,
-                data,
+                command,
             });
         }
 

@@ -1,5 +1,6 @@
 use rustyraftlab::raft::Role;
 use rustyraftlab::simulator::Simulator;
+use rustyraftlab::state_machine::Command;
 
 #[test]
 fn three_node_cluster_elects_a_leader() {
@@ -68,13 +69,43 @@ fn propose_replicates_and_applies_on_all_nodes() {
     let mut sim = Simulator::new(&[1, 2, 3], 150);
     let leader = sim.run_until_leader(500).expect("leader elected");
 
-    sim.propose(leader, b"cmd1".to_vec())
+    sim.propose_command(leader, Command::set("cmd1", "value1"))
         .expect("proposal should succeed");
 
+    assert!(sim.cluster_state_matches());
     for &id in &[1, 2, 3] {
         assert_eq!(sim.node(id).commit_index, 1);
         assert_eq!(sim.node(id).last_applied, 1);
-        assert_eq!(sim.node(id).applied, vec![b"cmd1".to_vec()]);
+        assert_eq!(sim.node(id).state_machine.get("cmd1"), Some("value1"));
+    }
+}
+
+#[test]
+fn cluster_reaches_agreement_after_multiple_commands() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    let leader = sim.run_until_leader(500).expect("leader elected");
+
+    sim.propose_command(leader, Command::set("a", "1"))
+        .expect("first proposal");
+    sim.propose_command(leader, Command::set("b", "2"))
+        .expect("second proposal");
+    sim.propose_command(leader, Command::delete("a"))
+        .expect("third proposal");
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).commit_index, 3);
+        assert_eq!(sim.node(id).last_applied, 3);
+        assert_eq!(sim.node(id).state_machine.get("a"), None);
+        assert_eq!(sim.node(id).state_machine.get("b"), Some("2"));
+        assert_eq!(
+            sim.node(id).state_machine.applied_commands(),
+            &[
+                Command::set("a", "1"),
+                Command::set("b", "2"),
+                Command::delete("a"),
+            ]
+        );
     }
 }
 
@@ -106,5 +137,32 @@ fn initial_heartbeats_keep_followers_from_electing_immediately() {
         if id != leader {
             assert_eq!(sim.node(id).role, Role::Follower);
         }
+    }
+}
+
+#[test]
+fn partitioned_node_catches_up_state_after_heal() {
+    let mut sim = Simulator::new(&[1, 2, 3], 150);
+    sim.run_until_leader(500).expect("initial leader");
+
+    sim.partition(1, 2);
+    sim.partition(1, 3);
+    sim.run_ticks(500);
+
+    let leader = [2, 3]
+        .into_iter()
+        .find(|&id| sim.node(id).role == Role::Leader)
+        .expect("majority partition should elect leader among nodes 2 and 3");
+
+    sim.propose_command(leader, Command::set("k", "v"))
+        .expect("majority should commit");
+
+    sim.heal(1, 2);
+    sim.heal(1, 3);
+    sim.run_ticks(300);
+
+    assert!(sim.cluster_state_matches());
+    for &id in &[1, 2, 3] {
+        assert_eq!(sim.node(id).state_machine.get("k"), Some("v"));
     }
 }
