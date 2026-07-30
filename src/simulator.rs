@@ -159,9 +159,7 @@ impl Simulator {
     /// Returns true if every live node has the same state machine contents.
     pub fn cluster_state_matches(&self) -> bool {
         let live_ids: Vec<_> = self
-            .node_ids()
-            .into_iter()
-            .filter(|id| !self.crashed.contains(id))
+            .live_node_ids()
             .collect();
         let Some(first) = live_ids.first().copied() else {
             return true;
@@ -172,6 +170,57 @@ impl Simulator {
             .iter()
             .skip(1)
             .all(|&id| self.node(id).state_machine == expected)
+    }
+
+    /// Returns true if shared log prefixes satisfy the Raft log-matching property.
+    pub fn logs_satisfy_matching_property(&self) -> bool {
+        let ids: Vec<_> = self.live_node_ids().collect();
+        for left in 0..ids.len() {
+            for right in (left + 1)..ids.len() {
+                let left_node = self.node(ids[left]);
+                let right_node = self.node(ids[right]);
+                let shared_last = left_node.last_log_index().min(right_node.last_log_index());
+
+                for index in 0..=shared_last {
+                    if left_node.log_term_at(index) != right_node.log_term_at(index) {
+                        return false;
+                    }
+                    if left_node.log[index as usize].data != right_node.log[index as usize].data {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns true if all live nodes share the same committed prefix and apply index.
+    pub fn committed_prefix_matches(&self) -> bool {
+        let ids: Vec<_> = self.live_node_ids().collect();
+        let Some(first) = ids.first().copied() else {
+            return true;
+        };
+
+        let expected_commit = self.node(first).commit_index;
+        let expected_applied = self.node(first).last_applied;
+
+        ids.iter().all(|&id| {
+            self.node(id).commit_index == expected_commit
+                && self.node(id).last_applied == expected_applied
+        })
+    }
+
+    /// Propose a command, then run ticks so replication can settle.
+    pub fn propose_and_settle(&mut self, leader_id: u64, command: Command) -> Result<(), ProposeError> {
+        self.propose_command(leader_id, command)?;
+        self.run_ticks(60);
+        Ok(())
+    }
+
+    fn live_node_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.node_ids()
+            .into_iter()
+            .filter(|id| !self.crashed.contains(id))
     }
 
     /// Propose raw log bytes to the cluster through the given leader.

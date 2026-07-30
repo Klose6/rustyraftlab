@@ -359,9 +359,16 @@ impl RaftNode {
             }
         }
 
-        // 7. Advance commit_index if the leader has committed further (capped by our log length).
+        // 7. Advance commit_index if the leader has committed further.
+        // Only entries known to match the leader's log may be committed: the last
+        // new entry in this RPC, or prev_log_index when entries is empty (heartbeat).
+        let last_new_index = if request.entries.is_empty() {
+            request.prev_log_index
+        } else {
+            request.prev_log_index + request.entries.len() as u64
+        };
         if request.leader_commit_index > self.commit_index {
-            self.commit_index = std::cmp::min(request.leader_commit_index, self.last_log_index());
+            self.commit_index = std::cmp::min(request.leader_commit_index, last_new_index);
         }
 
         // 8. Apply newly committed entries to the state machine.
