@@ -6,3 +6,7 @@ description = "A Raft implementation in Rust with a deterministic fault-injectio
 readme = "README.md"
 
 [dependencies]
+rocksdb = "0.24.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

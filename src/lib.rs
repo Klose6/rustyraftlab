@@ -1,5 +1,6 @@
 //! rustyraftlab — Raft implementation with a deterministic simulator.
 
 pub mod raft;
+pub mod rocksdb;
 pub mod simulator;
 pub mod state_machine;
